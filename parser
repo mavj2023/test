@@ -1,0 +1,381 @@
+---
+title: "Report Parser"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load Packages
+pkgs <- c("pdftools", "dplyr", "tidyr", "stringr", "stringdist", "tesseract", "parallel", "lubridate", "rjson", "SimDesign", "readxl")
+
+miss <- setdiff(pkgs, rownames(installed.packages()))
+
+if (length(miss)) {
+  install.packages(miss)
+}
+
+suppressPackageStartupMessages(lapply(pkgs, require, character.only = T))
+```
+
+```{r directories, include=FALSE}
+BASE <- "C:\\Users\\jorda\\OneDrive - Safer Schools Together\\"
+WOBDir <- paste0(BASE, "WOB Manager\\10 June 2022\\")
+
+wob_fn <- paste0(WOBDir, list.files(WOBDir, pattern = ".*\\.pdf", recursive = T))
+# Excludes WOBs that used the old WOB template
+wob_fn <- wob_fn[!grepl(pat = "Sharepoint 2018-2019", x = wob_fn)]
+
+#----
+# IMPORTANT
+# Update blue text found between quotes beside variable 'current_month'
+#----
+
+# Update current_month to specify the month and year that you
+# want to pull WOB data from
+# Month YYYY
+current_month <- "June 2022"
+
+wob_fn <- wob_fn[grepl(pat = current_month, x = wob_fn)]
+```
+
+```{r}
+report_fn <- gsub("^.*(\\\\|\\/)", "", wob_fn)
+
+report_month <- str_extract(report_fn, "\\w* \\d{4}")
+```
+
+```{r report metadata, include=FALSE}
+wobs_text <- lapply(wob_fn, pdf_text)
+
+report_date <- unlist(lapply(wobs_text, "[[", 1))
+report_date <- str_extract(pat = "(\\d{1,2}/\\d{1,2}/\\d{4}|\\d{4}-\\d{1,2}-\\d{1,2})", report_date)
+alt_date_format_ind <- grepl("\\d{1,2}/\\d{1,2}/\\d{4}", report_date)
+alt_date <- mdy(report_date[alt_date_format_ind])
+report_date <- ymd(report_date)
+report_date[alt_date_format_ind] <- alt_date
+
+report_num <- gsub("WOB Report ", "", str_extract(report_fn, "WOB Report \\d\\w?"))
+report_district <- gsub("(\\w* \\d{4}\\/)|( WOB Report( *\\d\\w?)? *- *\\w* \\d{4} *\\.pdf)", "", report_fn)
+```
+
+```{r table of contents, include=FALSE}
+toc_pg_end <- lapply(wobs_text, grep, pat = "\\.{2,} \\d+")
+```
+
+```{r pull record and sm pages, include=FALSE}
+record_pg_ind <- lapply(wobs_text, grep, pat = "\\sConcern(\\s\\(S(O|o)C\\))?:|Related (Person|Student|Account|Community|Subject):|(Account|Student|Subject) Name:|\r\nStudent:")
+tot_num_pg_wob <- sapply(wobs_text, length)
+sm_pg_ind <- lapply(wobs_text, grep, pat = "Information & Activity")
+
+record_pg <- NULL
+sm_pg <- NULL
+sm_pg_unlisted <- NULL
+for (i in seq_along(wobs_text)) {
+  record_pg_ind[[i]] <- setdiff(record_pg_ind[[i]], toc_pg_end[[i]])
+  
+  record_pg[[i]] <- wobs_text[[i]][record_pg_ind[[i]]]
+  
+  sm_pg[[i]] <- wobs_text[[i]][sm_pg_ind[[i]]]
+  info_n_activity <- lapply(sm_pg[[i]], str_extract, "\\w* Information & Activity\r?\n")
+  sm_pg[[i]] <- str_split(sm_pg[[i]], "\\w* Information & Activity") %>% lapply("[", -1)
+  
+  for (j in seq_along(sm_pg[[i]])) {
+    sm_pg[[i]][[j]] <- paste(info_n_activity[j], sm_pg[[i]][[j]])
+  }
+  
+  sm_pg_unlisted[[i]] <- sm_pg[[i]]
+  sm_pg[[i]] <- unlist(sm_pg[[i]])
+}
+```
+
+```{r record and sm pg info, include=FALSE}
+num_sm_per_ind <- lapply(sm_pg_unlisted, function(x) sapply(x, length))
+
+sm_pg_ind_stack <- vector(mode = "list", length = length(wobs_text))
+for(i in seq_along(wobs_text)) {
+  for(j in seq_along(sm_pg_ind[[i]])) {
+    if (num_sm_per_ind[[i]][j] > 1) {
+      sm_pg_ind_stack[[i]] <- c(sm_pg_ind_stack[[i]], rep(sm_pg_ind[[i]][j], num_sm_per_ind[[i]][j]))
+    } else {
+      sm_pg_ind_stack[[i]] <- c(sm_pg_ind_stack[[i]], sm_pg_ind[[i]][j])
+    }
+  }
+}
+
+record_pg_rng <- NULL
+for (i in seq_along(wobs_text)) {
+  record_pg_rng[[i]] <- c(record_pg_ind[[i]], tot_num_pg_wob[[i]])
+}
+```
+
+```{r assigning record ids to page indexes, include=FALSE}
+record_id <- lapply(record_pg_ind, seq_along)
+all_pg_ind_wob <- lapply(tot_num_pg_wob, function(x) 1:x)
+
+sm_record_id <- NULL
+for (i in seq_along(wobs_text)) {
+  c(1, sm_pg_ind_stack[[i]], tot_num_pg_wob[i])
+  
+  sm_ind_df <- data.frame("pg" = c(1, sm_pg_ind_stack[[i]], tot_num_pg_wob[i])) %>%
+    complete(pg = full_seq(pg, period = 1)) %>%
+    full_join(data.frame("record_ind" = record_pg_ind[[i]], "id" = record_id[[i]]), by = c("pg" = "record_ind")) %>%
+    fill(id) %>%
+    filter(pg %in% sm_pg_ind_stack[[i]])
+  
+  sm_record_id[[i]] <- sm_ind_df$id
+}
+```
+
+```{r compute pages of documentation, include=FALSE}
+record_num_pg <- lapply(record_pg_rng, function(x) head(lead(x) - x, -1))
+
+sm_num_pg <- NULL
+for (i in seq_along(wobs_text)) {
+  record_and_sm_pg_ind <- sort(c(sm_pg_ind_stack[[i]], setdiff(record_pg_rng[[i]], sm_pg_ind_stack[[i]])))
+  
+  sm_num_pg[[i]] <- lead(record_and_sm_pg_ind) - record_and_sm_pg_ind
+  
+  sm_num_pg_remove <- record_and_sm_pg_ind %in% setdiff(record_pg_rng[[i]], sm_pg_ind_stack[[i]])
+  
+  sm_num_pg[[i]] <- sm_num_pg[[i]][!sm_num_pg_remove]
+  sm_num_pg[[i]][sm_num_pg[[i]] == 0] <- 1
+}
+```
+
+```{r pull sm info, include=FALSE}
+sm_ls <- lapply(sm_pg, str_extract, "\\w*(?= Information & Activity)")
+
+us_ls <- lapply(sm_pg, str_extract, "(?<= (U|u)sername:\\s{0,10})(\\S.*|)(?=\\s{0,10}\r?\n)")
+
+dn_ls <- lapply(sm_pg, str_extract, "(?<= Display Name:\\s{0,10})(\\S.*|)(?=\\s{0,10}\r?\n)")
+
+smid_ls <- lapply(sm_pg, str_extract, "(?<= ID:\\s{0,10})(\\S.*|)(?=\\s{0,10}\\\r?\\\n)")
+
+url_ls <- lapply(sm_pg, str_extract, "(?<= (URL|url):\\s{0,10})(\\S.*(?=\\s{0,10}\\\r?\\\n)|\r?\n.*(?=\\s{0,10}\\\r?\\\n))")
+url_ls <- lapply(url_ls, function(x) gsub("^\r?\n\\s*|^\\s*", "", x))
+
+sm_info <- NULL
+for (i in seq_along(wobs_text)) {
+  num_rows <- length(sm_record_id[[i]])
+  
+  sm_info[[i]] <- data.frame(
+    "month" = rep(report_month[i],num_rows),
+    "district" = rep(report_district[i], num_rows),
+    "report_num" = rep(report_num[i], num_rows),
+    "send_date" = rep(report_date[i], num_rows),
+    "record_id" = sm_record_id[[i]],
+    "sm_pg" = sm_pg_ind_stack[[i]],
+    "num_sm_pg" = sm_num_pg[[i]],
+    "sm_typ" = sm_ls[[i]],
+    "us" = us_ls[[i]],
+    "dn" = dn_ls[[i]],
+    "smid" = smid_ls[[i]],
+    "url" = url_ls[[i]]
+  )
+}
+
+sm_df <- bind_rows(sm_info) %>%
+  mutate(smid = ifelse(!is.na(smid), paste0("'", smid), smid))
+```
+
+```{r pull record info, include=FALSE}
+typ_ls <- lapply(record_pg, str_extract, "(?<=\\\r?\\\n\\s{0,10})(Account|Community|Friends?|Individual|Person|Relate?d|Students?|Subject)(?=.{1,100})")
+
+nam_ls <- lapply(record_pg, str_extract,
+                 "(?<=(\r\nStudent:|\\sConcern(\\s\\(S(O|o)C\\))?:|\\sName:|Related\\s(Person|Student|Account|Community|Subject):|Account (O|o)f Concern:|Account Name:)\\s{0,10})(\\S.*|)(?=\\s{0,10}\\\r?\\\n)")
+
+school_ls <- lapply(record_pg, str_extract, 
+                    "(?<=(Attend.{0,5}:|School Associated:|^Associated:|School:|Locat.{0,5}:|From:)\\s{0,10})\\S.*(?=\\s{0,10}\\\r?\\\n)")
+
+baseline_smy_ls <- lapply(record_pg, str_extract,
+       "(?<=Digital Behavioural Baseline Summary)(.|\\n)*(?=\\\n{3})")
+
+baseline_smy_ls <- lapply(baseline_smy_ls, gsub,
+       pat = "(^\\\n{2,})|(\\s{2,})", rep = " ")
+
+entity_info <- NULL
+for (i in seq_along(wobs_text)) {
+  num_rows <- length(record_id[[i]])
+  
+  entity_info[[i]] <- data.frame(
+    "month" = rep(report_month[i],num_rows),
+    "district" = rep(report_district[i], num_rows),
+    "report_num" = rep(report_num[i], num_rows),
+    "send_date" = rep(report_date[i], num_rows),
+    "record_id" = record_id[[i]],
+    "record_pg" = record_pg_ind[[i]],
+    "num_record_pg" = record_num_pg[[i]],
+    "entity_typ" = typ_ls[[i]],
+    "entity_nam" = nam_ls[[i]],
+    "school" = school_ls[[i]],
+    "summary" = gsub("^ ", "", baseline_smy_ls[[i]])
+  )
+}
+
+entity_df <- bind_rows(entity_info)
+```
+
+```{r pull concern categories, include=FALSE}
+check_ls <- lapply(record_pg, str_extract_all, pat = "\u{2610}|\u{2612}")
+check_ls <- lapply(check_ls, function(x) lapply(x, grepl, pat = "\u{2612}"))
+
+cat_ls <- lapply(record_pg, str_extract_all, "(?<=(\u{2610}|\u{2612})\\s)[^\\s][^\u{2610}\u{2612}\\\r?]*[^\\s]{2,}")
+cat_ls <- lapply(cat_ls, function(x) lapply(x, gsub, pat = "\\\n\\\n\\\n.*", rep = "", x))
+
+cat_df_ls <- check_ls
+for (i in seq_along(check_ls)) {
+  for (j in seq_along(check_ls[[i]])) {
+    drop_cat <- grepl("(Acquaintance)|(Apparent Recipient of Threats)|(Is Family)|(Potential Influencer of Worrisome behaviour)", cat_ls[[i]][[j]])
+    
+    cat_df_ls[[i]][[j]] <- data.frame("month" = report_month[i],
+                                      "district" = report_district[i],
+                                      "report_num" = report_num[i],
+                                      "record_id" = record_id[[i]][[j]],
+                                      "num_concerns" = sum(check_ls[[i]][[j]][!drop_cat], na.rm = T),
+                                      t(check_ls[[i]][[j]][!drop_cat])
+                                      )
+
+    if (length(cat_ls[[i]][[j]][!drop_cat])) {
+      names(cat_df_ls[[i]][[j]]) <- c("month", "district", "report_num", "record_id", "num_concerns", cat_ls[[i]][[j]][!drop_cat])
+    }
+  }
+}
+
+cat_df <- bind_rows(lapply(cat_df_ls, bind_rows))
+
+cat_df[-c(1:5)][is.na(cat_df[-c(1:5)])] <- FALSE
+
+clean_cat_df <- cat_df %>%
+  pivot_longer(cols = !c(month, district, report_num, record_id, num_concerns), names_to = "dirty_cat", values_to = "is_concern") %>% 
+  mutate(clean_cat = case_when(
+    grepl("Wellness|Mental Health Concerns", dirty_cat) ~ "Mental Health Concerns",
+    grepl("Substance", dirty_cat) ~ "Substance Use Concerns",
+    grepl("Non-Suicidal|Self.(H|h)arm|Self.Injury", dirty_cat) ~ "Non-Suicidal Self-Harm",
+    grepl("Suicid(al|e) Ideation|Suicide Threat", dirty_cat) ~ "Suicidal Ideation",
+    grepl("Sexually|Extortion|Sextortion|Exploitation", dirty_cat) ~ "Risk of Sextortion",
+    grepl("Sexual Assault", dirty_cat) ~ "Sexual Assault",
+    grepl("Gang.Associated", dirty_cat) ~ "Gang-Associated Behaviour",
+    grepl("^Threat|Domestic Abuse", dirty_cat) ~ "Threat-Related Behaviour",
+    grepl("Illegal Activity|Property Damage", dirty_cat) ~ "Illegal Activity Misc.",
+    grepl("Physical Violence", dirty_cat) ~ "Physical Violence",
+    grepl("Firearms?$", dirty_cat) ~ "Firearms",
+    grepl("^Weapons", dirty_cat) ~ "Weapons",
+    grepl("Guns/Weapons|Firearms/Weapons", dirty_cat) ~ "Firearms/Weapons",
+    grepl("Student-run|Student Lead|Negative Peer|Peer Conflict|Negative Digital Climate", dirty_cat) ~ "Negative Digital Climate/Culture",
+    grepl("School Community Concerns", dirty_cat) ~ "School Community Concerns",
+    grepl("Harassment|Sharing Identifying|Impersonation|Online|Bullying", dirty_cat) ~ "Bullying/Cyberbullying",
+    grepl("Hate", dirty_cat) ~ "Hate/Racism or Radicalization",
+    grepl("Passed Away", dirty_cat) ~ "Passed Away",
+    T ~ "Misc."
+    )
+  ) %>% 
+  group_by(month, district, report_num, record_id, clean_cat) %>%
+  summarise(is_concern = ifelse(sum(is_concern) > 0, 1, 0)) %>%
+  distinct(month, district, report_num, record_id, clean_cat, is_concern) %>%
+  pivot_wider(id_cols = c(month, district, report_num, record_id), names_from = clean_cat, values_from = is_concern) %>%
+  rowwise() %>%
+  # mutate(num_concerns = sum(c_across(`Bullying/Cyberbullying`:Weapons)), .after = record_id) %>%
+  ungroup() %>% 
+  select(month, district, report_num, record_id, `Mental Health Concerns`, 
+         `Physical Violence`, `Threat-Related Behaviour`, `Suicidal Ideation`, 
+         `Illegal Activity Misc.`, `Firearms`, `Weapons`, `Gang-Associated Behaviour`,
+         `Substance Use Concerns`, `Non-Suicidal Self-Harm`, 
+         `Hate/Racism or Radicalization`, `Risk of Sextortion`, 
+         #At the moment this number is not reported to ministry
+         `Sexual Assault`,
+         `Negative Digital Climate/Culture`, 
+         # Will throw error for older reports if the category is not lsited in the report
+         `Passed Away`,
+         `Bullying/Cyberbullying`,
+         # Will throw error for older reports if the category is not lsited in the report
+         `School Community Concerns`
+         )
+
+#----
+# For account tracker
+#----
+col_all_concerns <- vector(mode = "character", length = nrow(cat_df))
+for (i in 1:nrow(cat_df)) {
+  if (length(names(cat_df)[-c(1:5)][as.logical(cat_df[i, -c(1:5)])])) {
+    col_all_concerns[i] <- paste(names(cat_df)[-c(1:5)][as.logical(cat_df[i, -c(1:5)])], collapse = ", ")
+  } else {
+    col_all_concerns[i] <- ""
+  }
+}
+
+cat_df <- bind_cols(cat_df[1:5],
+                    "concerns" = col_all_concerns,
+                    cat_df[-c(1:5)])
+```
+
+```{r}
+#----
+# Account Tracker
+#----
+
+cat_df_sub <- cat_df %>%
+  select(month, district, report_num, record_id, concerns) 
+
+account_tracker_df <- entity_df %>%
+  inner_join(cat_df_sub) %>% 
+  right_join(sm_df)
+
+# Creating the filename for 'sm_df_filename'
+# YYYYMMDD - WOB SM Data (MMM YYYY).csv
+account_tracker_df_filename <- paste0(gsub("-", "", as.character(Sys.Date())), 
+                             " - Account Tracker (", 
+                             current_month, 
+                             ").csv")
+
+write.csv(account_tracker_df, file = account_tracker_df_filename, row.names = F)
+
+#----
+# Feedback Tracker
+#----
+
+# Only considering BC districts
+SOC_df_for_feedback <- entity_df %>%
+  filter(grepl("^SD", district)) %>%
+  mutate(record_pg = record_pg - 1) %>%
+  select(month, district, report_num, record_pg, entity_nam, school)
+  
+SOC_df_filename <- paste0(gsub("-", "", as.character(Sys.Date())), 
+                             " - SOC List (", 
+                             current_month, 
+                             ").csv")
+
+write.csv(SOC_df_for_feedback, file = SOC_df_filename, row.names = F)
+
+#----
+# WOB Data Master List
+#----
+
+concerns_wob_df <- entity_df %>%
+  inner_join(clean_cat_df)
+
+sm_wob_df <- right_join(concerns_wob_df, sm_df)
+
+# Creating the filename for 'sm_df_filename'
+# YYYYMMDD - WOB SM Data (MMM YYYY).csv
+sm_df_filename <- paste0(gsub("-", "", as.character(Sys.Date())), 
+                             " - WOB SM Data (", 
+                             current_month, 
+                             ").csv")
+
+# Creating the filename for 'concerns_df_filename'
+# YYYYMMDD - WOB SM Data (MMM YYYY).csv
+concerns_df_filename <- paste0(gsub("-", "", as.character(Sys.Date())), 
+                             " - WOB Concerns Data (", 
+                             current_month, 
+                             ").csv")
+
+write.csv(sm_wob_df, file = sm_df_filename, row.names = F)
+
+write.csv(concerns_wob_df, file = concerns_df_filename, row.names = F)
+
+print("Below Directory is where the WOB Data file can be located.")
+getwd()
+```
